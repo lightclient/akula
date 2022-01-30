@@ -10,6 +10,7 @@ default-run = "akula"
 [dependencies]
 aes = "0.8"
 anyhow = "1"
+array-macro = "2"
 arrayref = "0.3"
 arrayvec = { version = "0.7", features = ["serde"] }
 array-init = "2"
