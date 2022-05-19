@@ -1280,8 +1280,9 @@ fn keybytes_to_hex(s: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use anyhow::Context;
-    use std::collections::hash_map::Entry;
+    use std::collections::{hash_map::Entry, HashSet};
 
+    #[derive(Debug, Default)]
     struct MockState {
         /// Backbone of the state
         sm: HashMap<Vec<u8>, Vec<u8>>,
@@ -1479,5 +1480,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Collects updates to the state
+    /// and provides them in properly sorted form
+    #[derive(Debug, Default)]
+    struct UpdateBuilder {
+        balances: HashMap<Address, U256>,
+        nonces: HashMap<Address, u64>,
+        code_hashes: HashMap<Address, H256>,
+        storages: HashMap<Address, HashMap<H256, U256>>,
+        deletes: HashSet<Address>,
+        deletes2: HashMap<Address, HashSet<H256>>,
+        keyset: HashSet<Address>,
+        keyset2: HashMap<Address, HashSet<H256>>,
+    }
+
+    impl UpdateBuilder {
+        pub fn balance(mut self, addr: Address, balance: impl AsU256) -> Self {
+            self.deletes.remove(&addr);
+            self.balances.insert(addr, balance.as_u256());
+            self.keyset.insert(addr);
+
+            self
+        }
+    }
+
+    #[test]
+    fn empty_state() {
+        let mut ms = MockState::default();
     }
 }
