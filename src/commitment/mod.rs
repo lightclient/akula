@@ -1,4 +1,3 @@
-pub mod gen;
 pub mod rlputil;
 
 use self::rlputil::*;
@@ -11,7 +10,6 @@ use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use bytes::{BufMut, BytesMut};
 use derive_more::From;
-use gen::*;
 use sha3::{Digest, Keccak256};
 use std::{
     collections::HashMap,
@@ -351,7 +349,7 @@ fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 32> {
 }
 
 pub trait State {
-    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Vec<u8>>;
+    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     fn fetch_account(&mut self, address: Address, cell: &mut Cell) -> anyhow::Result<()>;
     fn fetch_storage(
         &mut self,
@@ -1586,137 +1584,129 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockState {
-        /// Backbone of the state
-        sm: HashMap<Vec<u8>, Vec<u8>>,
+        /// Backbone of the accounts
+        am: HashMap<Address, Vec<u8>>,
+        /// Backbone of the storage
+        sm: HashMap<(Address, H256), Vec<u8>>,
         /// Backbone of the commitments
         cm: HashMap<Vec<u8>, Vec<u8>>,
     }
 
-    impl MockState {
-        fn execute(
-            &mut self,
-            i: StartedInterrupt<HashMap<Vec<u8>, Vec<u8>>>,
-        ) -> HashMap<Vec<u8>, Vec<u8>> {
-            let mut interrupt = i.resume();
-
-            loop {
-                interrupt = match interrupt {
-                    Interrupt::LoadBranch { interrupt, prefix } => interrupt.resume({
-                        BranchData(self.cm.get(&prefix).map(|v| {
-                            v[2..] // Skip touchMap, but keep afterMap
-                                .to_vec()
-                        }))
-                    }),
-                    Interrupt::LoadAccount {
-                        interrupt,
-                        plain_key,
-                        mut cell,
-                    } => interrupt.resume({
-                        let ex_bytes = &self.sm[&plain_key];
-
-                        let (ex, pos) = Update::decode(ex_bytes, 0).unwrap();
-
-                        assert_eq!(
-                            pos,
-                            ex_bytes.len(),
-                            "accountFn key [{}] leftover bytes in [{}], consumed {:02x}",
-                            hex::encode(plain_key),
-                            hex::encode(ex_bytes),
-                            pos
-                        );
-                        assert_eq!(
-                            ex.flags & STORAGE_UPDATE,
-                            0,
-                            "accountFn reading storage item for key [{}]",
-                            hex::encode(&plain_key)
-                        );
-                        assert_eq!(
-                            ex.flags & DELETE_UPDATE,
-                            0,
-                            "accountFn reading deleted account for key [{}]",
-                            hex::encode(&plain_key)
-                        );
-                        if ex.flags & BALANCE_UPDATE != 0 {
-                            cell.balance = ex.balance;
-                        } else {
-                            cell.balance = U256::ZERO;
-                        }
-                        if ex.flags & NONCE_UPDATE != 0 {
-                            cell.nonce = ex.nonce;
-                        } else {
-                            cell.nonce = 0;
-                        }
-                        if ex.flags & CODE_UPDATE != 0 {
-                            cell.code_hash[..].copy_from_slice(&ex.code_hash_or_storage[..]);
-                        } else {
-                            cell.code_hash = EMPTY_HASH;
-                        }
-
-                        FilledAccount(cell)
-                    }),
-                    Interrupt::LoadStorage {
-                        interrupt,
-                        plain_key,
-                        mut cell,
-                    } => interrupt.resume({
-                        let ex_bytes = &self.sm[&plain_key];
-
-                        let (ex, pos) = Update::decode(ex_bytes, 0)
-                            .with_context(|| {
-                                format!(
-                                    "storage decode existing [{}], bytes: [{}]",
-                                    hex::encode(&plain_key),
-                                    hex::encode(&ex_bytes)
-                                )
-                            })
-                            .unwrap();
-                        assert_eq!(
-                            pos,
-                            ex_bytes.len(),
-                            "storageFn key [{}] leftover bytes in [{}], comsumed {:02x}",
-                            hex::encode(&plain_key),
-                            hex::encode(ex_bytes),
-                            pos
-                        );
-                        assert_eq!(
-                            ex.flags & BALANCE_UPDATE,
-                            0,
-                            "storageFn reading balance for key [{}]",
-                            hex::encode(plain_key)
-                        );
-                        assert_eq!(
-                            ex.flags & NONCE_UPDATE,
-                            0,
-                            "storageFn reading nonce for key [{}]",
-                            hex::encode(plain_key)
-                        );
-                        assert_eq!(
-                            ex.flags & CODE_UPDATE,
-                            0,
-                            "storageFn reading code hash for key [{}]",
-                            hex::encode(plain_key)
-                        );
-                        assert_eq!(
-                            ex.flags & DELETE_UPDATE,
-                            0,
-                            "storageFn reading deleted item for key [{}]",
-                            hex::encode(plain_key)
-                        );
-                        if ex.flags & STORAGE_UPDATE != 0 {
-                            cell.storage = Some(U256::from_be_bytes(static_left_pad(
-                                &ex.code_hash_or_storage,
-                            )));
-                        } else {
-                            cell.storage = None;
-                        }
-                        FilledStorage(cell)
-                    }),
-                    Interrupt::BranchUpdate { .. } => unreachable!(),
-                    Interrupt::Complete { result, .. } => return result,
-                }
-            }
+    impl State for MockState {
+        fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+            Ok(self.cm.get(&prefix).map(|v| {
+                v[2..] // Skip touchMap, but keep afterMap
+                    .to_vec()
+            }))
         }
 
+        fn fetch_account(&mut self, address: Address, cell: &mut Cell) -> anyhow::Result<()> {
+            let ex_bytes = &self.am[&address];
+
+            let (ex, pos) = Update::decode(ex_bytes, 0).unwrap();
+
+            assert_eq!(
+                pos,
+                ex_bytes.len(),
+                "accountFn key [{}] leftover bytes in [{}], consumed {:02x}",
+                hex::encode(address),
+                hex::encode(ex_bytes),
+                pos
+            );
+            assert_eq!(
+                ex.flags & STORAGE_UPDATE,
+                0,
+                "accountFn reading storage item for key [{}]",
+                hex::encode(&address)
+            );
+            assert_eq!(
+                ex.flags & DELETE_UPDATE,
+                0,
+                "accountFn reading deleted account for key [{}]",
+                hex::encode(&address)
+            );
+            if ex.flags & BALANCE_UPDATE != 0 {
+                cell.balance = ex.balance;
+            } else {
+                cell.balance = U256::ZERO;
+            }
+            if ex.flags & NONCE_UPDATE != 0 {
+                cell.nonce = ex.nonce;
+            } else {
+                cell.nonce = 0;
+            }
+            if ex.flags & CODE_UPDATE != 0 {
+                cell.code_hash = H256::from_slice(&ex.code_hash_or_storage[..]);
+            } else {
+                cell.code_hash = EMPTY_HASH;
+            }
+
+            Ok(())
+        }
+
+        fn fetch_storage(
+            &mut self,
+            address: Address,
+            location: H256,
+            cell: &mut Cell,
+        ) -> anyhow::Result<()> {
+            let plain_key = (address, location);
+            let ex_bytes = &self.sm[&plain_key];
+
+            let (ex, pos) = Update::decode(ex_bytes, 0)
+                .with_context(|| {
+                    format!(
+                        "storage decode existing [{:?}], bytes: [{}]",
+                        plain_key,
+                        hex::encode(&ex_bytes)
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                pos,
+                ex_bytes.len(),
+                "storageFn key [{:?}] leftover bytes in [{}], comsumed {:02x}",
+                plain_key,
+                hex::encode(ex_bytes),
+                pos
+            );
+            assert_eq!(
+                ex.flags & BALANCE_UPDATE,
+                0,
+                "storageFn reading balance for key [{:?}]",
+                plain_key
+            );
+            assert_eq!(
+                ex.flags & NONCE_UPDATE,
+                0,
+                "storageFn reading nonce for key [{:?}]",
+                plain_key
+            );
+            assert_eq!(
+                ex.flags & CODE_UPDATE,
+                0,
+                "storageFn reading code hash for key [{:?}]",
+                plain_key
+            );
+            assert_eq!(
+                ex.flags & DELETE_UPDATE,
+                0,
+                "storageFn reading deleted item for key [{:?}]",
+                plain_key
+            );
+            if ex.flags & STORAGE_UPDATE != 0 {
+                cell.storage = Some(U256::from_be_bytes(static_left_pad(
+                    &ex.code_hash_or_storage,
+                )));
+            } else {
+                cell.storage = None;
+            }
+
+            Ok(())
+        }
+    }
+
+    impl MockState {
         fn apply_plain_updates(
             &mut self,
             plain_keys: Vec<Vec<u8>>,
