@@ -2,7 +2,9 @@ pub mod gen;
 pub mod rlputil;
 
 use self::rlputil::*;
-use crate::{crypto::keccak256, models::*, static_left_pad, u256_to_h256, zeroless_view};
+use crate::{
+    crypto::keccak256, models::*, prefix_length, static_left_pad, u256_to_h256, zeroless_view,
+};
 use anyhow::{bail, format_err};
 use array_macro::array;
 use arrayref::array_ref;
@@ -17,7 +19,7 @@ use std::{
     pin::Pin,
     ptr::addr_of_mut,
 };
-use tracing::trace;
+use tracing::*;
 
 pub trait Trie {
     type Hash;
@@ -66,50 +68,6 @@ fn encode_uvarint(out: &mut Vec<u8>, mut x: u64) {
 fn encode_slice(out: &mut Vec<u8>, s: &[u8]) {
     encode_uvarint(out, s.len() as u64);
     out.extend_from_slice(s);
-}
-
-impl Account {
-    pub fn decode2(buffer: &[u8]) -> Self {
-        let mut pos = 0_usize;
-        let nonce = if buffer[pos] < 128 {
-            buffer[pos].into()
-        } else {
-            let size_bytes = usize::from(buffer[pos] - 128);
-            pos += 1;
-            let (nonce, n) = uvarint(&buffer[pos..pos + size_bytes]).unwrap();
-            pos += n;
-
-            nonce
-        };
-
-        let balance = if buffer[pos] < 128 {
-            let balance = buffer[pos].into();
-            pos += 1;
-
-            balance
-        } else {
-            let bc = usize::from(buffer[pos] - 128);
-            pos += 1;
-            let balance = U256::from_be_bytes(static_left_pad(&buffer[pos..pos + bc]));
-            pos += bc;
-
-            balance
-        };
-
-        let code_size = usize::from(buffer[pos] - 128);
-        let code_hash = if code_size > 0 {
-            pos += 1;
-            H256(static_left_pad(&buffer[pos..pos + code_size]))
-        } else {
-            H256::zero()
-        };
-
-        Self {
-            nonce,
-            balance,
-            code_hash,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +210,20 @@ impl Default for CellGrid {
 
 impl CellGrid {
     #[inline(always)]
+    fn cell(&self, cell_position: Option<CellPosition>) -> &Cell {
+        if let Some(position) = cell_position {
+            self.grid_cell(position)
+        } else {
+            &self.root
+        }
+    }
+
+    #[inline(always)]
+    fn grid_cell(&self, cell_position: CellPosition) -> &Cell {
+        &self.grid[cell_position.row as usize][cell_position.col as usize]
+    }
+
+    #[inline(always)]
     fn cell_mut(&mut self, cell_position: Option<CellPosition>) -> &mut Cell {
         if let Some(position) = cell_position {
             self.grid_cell_mut(position)
@@ -378,10 +350,23 @@ fn hash_key(plain_key: &[u8], hashed_key_offset: usize) -> ArrayVec<u8, 32> {
     dest
 }
 
+pub trait State {
+    fn load_branch(&mut self, prefix: &[u8]) -> anyhow::Result<Vec<u8>>;
+    fn fetch_account(&mut self, address: Address, cell: &mut Cell) -> anyhow::Result<()>;
+    fn fetch_storage(
+        &mut self,
+        address: Address,
+        location: H256,
+        cell: &mut Cell,
+    ) -> anyhow::Result<()>;
+}
+
 /// HexPatriciaHashed implements commitment based on patricia merkle tree with radix 16,
 /// with keys pre-hashed by keccak256
 #[derive(Debug)]
-pub struct HexPatriciaHashed {
+pub struct HexPatriciaHashed<'state, S: State> {
+    state: &'state mut S,
+
     grid: CellGrid,
     // How many rows (starting from row 0) are currently active and have corresponding selected columns
     // Last active row does not have selected column
@@ -396,37 +381,8 @@ pub struct HexPatriciaHashed {
     branch_before: [bool; 128], // For each row, whether there was a branch node in the database loaded in unfold
     touch_map: [u16; 128], // For each row, bitmap of cells that were either present before modification, or modified or deleted
     after_map: [u16; 128], // For each row, bitmap of cells that were present after modification
-    // Function used to load branch node and fill up the cells
-    // For each cell, it sets the cell type, clears the modified flag, fills the hash,
-    // and for the extension, account, and leaf type, the `l` and `k`
-    // branchFn: Box<dyn Fn(prefix: &[u8]) -> func(prefix []byte) ([]byte, error)
-    // Function used to fetch account with given plain key. It loads
-    // accountFn func(plainKey []byte, cell *Cell) error
-    // Function used to fetch account with given plain key
-    // storageFn       func(plainKey []byte, cell *Cell) error
-    // keccak          keccakState
-    // keccak2         keccakState
     account_key_len: usize,
     byte_array_writer: BytesMut,
-}
-
-impl Default for HexPatriciaHashed {
-    fn default() -> Self {
-        Self {
-            grid: Default::default(),
-            active_rows: Default::default(),
-            current_key: Default::default(),
-            depths: [0; 128],
-            root_checked: Default::default(),
-            root_touched: Default::default(),
-            root_present: Default::default(),
-            branch_before: [false; 128],
-            touch_map: [0; 128],
-            after_map: [0; 128],
-            account_key_len: Default::default(),
-            byte_array_writer: Default::default(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -536,7 +492,26 @@ pub struct ProcessUpdateArg {
     pub update: Update,
 }
 
-impl HexPatriciaHashed {
+impl<'state, S: State> HexPatriciaHashed<'state, S> {
+    pub fn new(state: &'state mut S) -> Self {
+        Self {
+            state,
+
+            grid: Default::default(),
+            active_rows: Default::default(),
+            current_key: Default::default(),
+            depths: [0; 128],
+            root_checked: Default::default(),
+            root_touched: Default::default(),
+            root_present: Default::default(),
+            branch_before: [false; 128],
+            touch_map: [0; 128],
+            after_map: [0; 128],
+            account_key_len: Default::default(),
+            byte_array_writer: Default::default(),
+        }
+    }
+
     pub fn root_hash(&mut self) -> H256 {
         H256::from_slice(&self.compute_cell_hash(None, 0)[1..])
     }
@@ -544,41 +519,83 @@ impl HexPatriciaHashed {
     pub fn process_updates(
         &mut self,
         updates: Vec<ProcessUpdateArg>,
-    ) -> StartedInterrupt<'_, HashMap<Vec<u8>, Vec<u8>>> {
-        let inner = move |_| {
-            let mut branch_node_updates = HashMap::new();
+    ) -> anyhow::Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let mut branch_node_updates = HashMap::new();
 
-            for ProcessUpdateArg {
-                hashed_key,
+        for ProcessUpdateArg {
+            hashed_key,
+            plain_key,
+            update,
+        } in updates
+        {
+            trace!(
+                "plain_key={:?}, hashed_key={:?}, current_key={:?}, update={:?}",
                 plain_key,
-                update,
-            } in updates
-            {
-                trace!(
-                    "plain_key={:?}, hashed_key={:?}, current_key={:?}, update={:?}",
-                    plain_key,
-                    hashed_key,
-                    hex::encode(&self.current_key),
-                    update
-                );
+                hashed_key,
+                hex::encode(&self.current_key),
+                update
+            );
 
-                // Keep folding until the currentKey is the prefix of the key we modify
-                while self.need_folding(hashed_key) {
-                    let (branch_node_update, update_key) = self.fold();
-                    if let Some(branch_node_update) = branch_node_update {
-                        branch_node_updates.insert(update_key, branch_node_update);
-                    }
+            // Keep folding until the current_key is the prefix of the key we modify
+            while self.need_folding(hashed_key) {
+                let (branch_node_update, update_key) = self.fold();
+                if let Some(branch_node_update) = branch_node_update {
+                    branch_node_updates.insert(update_key, branch_node_update);
                 }
             }
 
-            yield InterruptData::LoadBranch { prefix: vec![] };
+            // Now unfold until we step on an empty cell
+            loop {
+                let unfolding = self.need_unfolding(&hashed_key[..]);
+                if unfolding == 0 {
+                    break;
+                }
 
-            branch_node_updates
-        };
+                self.unfold(hashed_key, unfolding)?;
+            }
 
-        StartedInterrupt {
-            inner: Box::new(inner),
+            // Update the cell
+            if update.flags == DELETE_UPDATE {
+                self.delete_cell(hashed_key);
+            } else {
+                if update.flags & BALANCE_UPDATE != 0 {
+                    self.update_balance(
+                        Address::from_slice(&plain_key),
+                        hashed_key,
+                        update.balance,
+                    );
+                }
+                if update.flags & NONCE_UPDATE != 0 {
+                    self.update_nonce(Address::from_slice(&plain_key), hashed_key, update.nonce);
+                }
+                if update.flags & CODE_UPDATE != 0 {
+                    self.update_code(
+                        Address::from_slice(&plain_key),
+                        hashed_key,
+                        H256::from_slice(&update.code_hash_or_storage[..]),
+                    );
+                }
+                if update.flags & STORAGE_UPDATE != 0 {
+                    self.update_storage(
+                        (
+                            Address::from_slice(&plain_key[..ADDRESS_LENGTH]),
+                            H256::from_slice(&plain_key[ADDRESS_LENGTH..]),
+                        ),
+                        hashed_key,
+                        U256::from_be_bytes(static_left_pad(&update.code_hash_or_storage[..])),
+                    );
+                }
+            }
         }
+
+        // Folding everything up to the root
+        while self.active_rows > 0 {
+            if let (Some(branch_data), update_key) = self.fold() {
+                branch_node_updates.insert(update_key, branch_data);
+            }
+        }
+
+        Ok(branch_node_updates)
     }
 
     fn compute_cell_hash(&mut self, pos: Option<CellPosition>, depth: usize) -> ArrayVec<u8, 33> {
@@ -681,6 +698,167 @@ impl HexPatriciaHashed {
         }
 
         buf
+    }
+
+    fn need_unfolding(&self, hashed_key: &[u8]) -> usize {
+        let cell: &Cell;
+        let mut depth = 0_usize;
+        if self.active_rows == 0 {
+            trace!("need_unfolding root, root_checked = {}", self.root_checked);
+            cell = self.grid.cell(None);
+            if cell.down_hashed_key.is_empty() && cell.h.is_none() && !self.root_checked {
+                // Need to attempt to unfold the root
+                return 1;
+            }
+        } else {
+            let col = hashed_key[self.current_key.len()] as usize;
+            cell = self.grid.cell(Some(CellPosition {
+                row: self.active_rows - 1,
+                col,
+            }));
+            depth = self.depths[self.active_rows - 1];
+            trace!(
+                "needUnfolding cell ({}, {}), currentKey=[{}], depth={}, cell.h=[{:?}]",
+                self.active_rows - 1,
+                col,
+                hex::encode(&self.current_key[..]),
+                depth,
+                cell.h
+            );
+        }
+        if hashed_key.len() <= depth {
+            return 0;
+        }
+        if cell.down_hashed_key.is_empty() {
+            if cell.h.is_none() {
+                // cell is empty, no need to unfold further
+                return 0;
+            } else {
+                // unfold branch node
+                return 1;
+            }
+        }
+        let cpl = prefix_length(&hashed_key[depth..], &cell.down_hashed_key[..]);
+        trace!(
+            "cpl={}, cell.downHashedKey=[{}], depth={}, hashedKey[depth..]=[{}]",
+            cpl,
+            hex::encode(&cell.down_hashed_key[..]),
+            depth,
+            hex::encode(&hashed_key[depth..]),
+        );
+        let mut unfolding = cpl + 1;
+        if depth < 64 && depth + unfolding > 64 {
+            // This is to make sure that unfolding always breaks at the level where storage subtrees start
+            unfolding = 64 - depth;
+            trace!("adjusted unfolding={}", unfolding);
+        }
+
+        unfolding
+    }
+
+    #[instrument(skip(self))]
+    fn unfold_branch_node(
+        &mut self,
+        row: usize,
+        deleted: bool,
+        depth: usize,
+    ) -> anyhow::Result<()> {
+        let branch_data = self
+            .state
+            .load_branch(&hex_to_compact(&self.current_key[..]))?;
+
+        todo!()
+    }
+
+    #[instrument(skip(self))]
+    fn unfold(&mut self, hashed_key: H256, unfolding: usize) -> anyhow::Result<()> {
+        // move |_| {
+        // trace!("Active rows = {}", self.active_rows);
+
+        // let up_cell: &mut Cell;
+        // let mut touched = false;
+        // let mut present = false;
+        // let mut col = 0;
+        // let mut upDepth = 0;
+        // let mut depth = 0;
+        // if self.activeRows == 0 {
+        //     let root = self.grid.cell_mut(None);
+        //     if self.rootChecked && root.h.is_none() && root.down_hashed_key.is_empty() {
+        //         // No unfolding for empty root
+        //         return Ok(());
+        //     }
+        //     up_cell = &root;
+        //     touched = self.root_touched;
+        //     present = self.root_present;
+        //     trace!("root, touched={}, present={}", touched, present);
+        // } else {
+        //     upDepth = self.depths[self.activeRows-1];
+        //     col = hashedKey[upDepth-1];
+        //     upCell = &hph.grid[hph.activeRows-1][col];
+        //     touched = hph.touchMap[hph.activeRows-1]&(uint16(1)<<col) != 0;
+        //     present = hph.afterMap[hph.activeRows-1]&(uint16(1)<<col) != 0;
+        //     trace!("upCell (%d, %x), touched %t, present %t\n", hph.activeRows-1, col, touched, present);
+        //     hph.currentKey[hph.currentKeyLen] = col;
+        //     hph.currentKeyLen+=1;
+        // }
+        // row := hph.activeRows;
+        //     self.grid.clear_row(row);
+        // hph.touchMap[row] = 0;
+        // hph.afterMap[row] = 0;
+        // hph.branchBefore[row] = false;
+        // if upCell.downHashedKey.is_empty() {
+        //     depth = upDepth + 1;
+        //     let _ = self.unfoldBranchNode(row, touched && !present /* deleted */, depth);
+        //     todo!()
+        // } else if upCell.downHashedKey.len() >= unfolding {
+        //     depth = upDepth + unfolding;
+        //     let nibble = upCell.downHashedKey[unfolding-1];
+        //     if touched {
+        //         hph.touchMap[row] = uint16(1) << nibble
+        //     }
+        //     if present {
+        //         hph.afterMap[row] = uint16(1) << nibble
+        //     }
+        //     cell := &hph.grid[row][nibble]
+        //     cell.fillFromUpperCell(upCell, depth, unfolding)
+        //     if hph.trace {
+        //         fmt.Printf("cell (%d, %x) depth=%d\n", row, nibble, depth)
+        //     }
+        //     if row >= 64 {
+        //         cell.apl = 0
+        //     }
+        //     if unfolding > 1 {
+        //         copy(hph.currentKey[hph.currentKeyLen:], upCell.downHashedKey[:unfolding-1])
+        //     }
+        //     hph.currentKeyLen += unfolding - 1
+        // } else {
+        //     // upCell.downHashedLen < unfolding
+        //     depth = upDepth + upCell.downHashedLen
+        //     nibble := upCell.downHashedKey[upCell.downHashedLen-1]
+        //     if touched {
+        //         hph.touchMap[row] = uint16(1) << nibble
+        //     }
+        //     if present {
+        //         hph.afterMap[row] = uint16(1) << nibble
+        //     }
+        //     cell := &hph.grid[row][nibble]
+        //     cell.fillFromUpperCell(upCell, depth, upCell.downHashedLen)
+        //     if hph.trace {
+        //         fmt.Printf("cell (%d, %x) depth=%d\n", row, nibble, depth)
+        //     }
+        //     if row >= 64 {
+        //         cell.apl = 0
+        //     }
+        //     if upCell.downHashedLen > 1 {
+        //         copy(hph.currentKey[hph.currentKeyLen:], upCell.downHashedKey[:upCell.downHashedLen-1])
+        //     }
+        //     hph.currentKeyLen += upCell.downHashedLen - 1
+        // }
+        // hph.depths[hph.activeRows] = depth
+        // hph.activeRows++
+
+        Ok(())
+        // }
     }
 
     fn need_folding(&self, hashed_key: H256) -> bool {
@@ -911,7 +1089,6 @@ impl HexPatriciaHashed {
                 let up_cell = self.grid.cell_mut(up_cell);
                 up_cell.extension.truncate(depth - up_depth - 1);
                 if !up_cell.extension.is_empty() {
-                    //// ?
                     up_cell.extension.clear();
                     up_cell
                         .extension
@@ -942,6 +1119,131 @@ impl HexPatriciaHashed {
             );
         }
         (branch_data, update_key)
+    }
+
+    #[instrument(skip(self))]
+    fn delete_cell(&mut self, hashed_key: H256) {
+        trace!("Active rows = {}", self.active_rows);
+        let cell: &mut Cell;
+        if self.active_rows == 0 {
+            // Remove the root
+            cell = self.grid.cell_mut(None);
+            self.root_touched = true;
+            self.root_present = false;
+        } else {
+            let row = self.active_rows - 1;
+            if self.depths[row] < hashed_key[..].len() {
+                trace!(
+                    "Skipping spurious delete depth={}, hashed_key_len={}",
+                    self.depths[row],
+                    hashed_key[..].len()
+                );
+                return;
+            }
+            let col = hashed_key[self.current_key.len()] as usize;
+            cell = self.grid.cell_mut(Some(CellPosition { row, col }));
+            if self.after_map[row] & 1_u16 << col != 0 {
+                // Prevent "spurios deletions", i.e. deletion of absent items
+                self.touch_map[row] |= 1_u16 << col as u16;
+                self.after_map[row] &= !(1_u16 << col as u16);
+                trace!("Setting ({}, {:02x})", row, col);
+            } else {
+                trace!("Ignoring ({}, {:02x})", row, col);
+            }
+        }
+        cell.extension.clear();
+        cell.balance = U256::ZERO;
+        cell.code_hash = EMPTY_HASH;
+        cell.nonce = 0;
+    }
+
+    #[instrument(skip(self))]
+    fn update_account(&mut self, plain_key: Address, hashed_key: H256) -> &mut Cell {
+        if self.active_rows == 0 {
+            self.active_rows += 1;
+        }
+        let row = self.active_rows - 1;
+        let depth = self.depths[self.active_rows - 1];
+        let col = hashed_key[self.current_key.len()] as usize;
+        let cell = self.grid.cell_mut(Some(CellPosition { row, col }));
+        self.touch_map[row] |= 1_u16 << col as u16;
+        self.after_map[row] |= 1_u16 << col as u16;
+        trace!("Setting ({}, {:02x}), depth={}", row, col, depth);
+        if cell.down_hashed_key.is_empty() {
+            cell.down_hashed_key
+                .try_extend_from_slice(&hashed_key[depth..])
+                .unwrap();
+            trace!(
+                "Set down_hashed_key=[{}]",
+                hex::encode(&cell.down_hashed_key[..])
+            );
+        } else {
+            trace!(
+                "Left down_hashed_key=[{}]",
+                hex::encode(&cell.down_hashed_key[..])
+            );
+        }
+        cell.apk = Some(plain_key);
+
+        cell
+    }
+
+    #[instrument(skip(self))]
+    fn update_balance(&mut self, plain_key: Address, hashed_key: H256, balance: U256) {
+        trace!("Active rows = {}", self.active_rows);
+        self.update_account(plain_key, hashed_key).balance = balance;
+    }
+
+    #[instrument(skip(self))]
+    fn update_code(&mut self, plain_key: Address, hashed_key: H256, code_hash: H256) {
+        trace!("Active rows = {}", self.active_rows);
+        self.update_account(plain_key, hashed_key).code_hash = code_hash;
+    }
+
+    #[instrument(skip(self))]
+    fn update_nonce(&mut self, plain_key: Address, hashed_key: H256, nonce: u64) {
+        trace!("Active rows = {}", self.active_rows);
+        self.update_account(plain_key, hashed_key).nonce = nonce;
+    }
+
+    #[instrument(skip(self))]
+    fn update_storage(&mut self, plain_key: (Address, H256), hashed_key: H256, value: U256) {
+        trace!("Active rows = {}", self.active_rows);
+        if self.active_rows == 0 {
+            self.active_rows += 1;
+        }
+        let depth = self.depths[self.active_rows - 1];
+        let col = hashed_key[self.current_key.len()] as usize;
+        let cell = self.grid.cell_mut(Some(CellPosition {
+            row: self.active_rows - 1,
+            col,
+        }));
+        self.touch_map[self.active_rows - 1] |= 1_u16 << col as u16;
+        self.after_map[self.active_rows - 1] |= 1_u16 << col as u16;
+        trace!(
+            "Setting ({}, {:02x}), touch_map[{}]={:#018b}, depth={}",
+            self.active_rows - 1,
+            col,
+            self.active_rows - 1,
+            self.touch_map[self.active_rows - 1],
+            depth
+        );
+        if cell.down_hashed_key.is_empty() {
+            cell.down_hashed_key
+                .try_extend_from_slice(&hashed_key[depth..])
+                .unwrap();
+            trace!(
+                "set down_hashed_key=[{}]",
+                hex::encode(&cell.down_hashed_key[..])
+            );
+        } else {
+            trace!(
+                "left down_hashed_key=[{}]",
+                hex::encode(&cell.down_hashed_key[..])
+            );
+        }
+        cell.spk = Some(plain_key);
+        cell.storage = Some(value);
     }
 }
 
